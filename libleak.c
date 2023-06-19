@@ -10,7 +10,8 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <unistd.h>
-
+#include <execinfo.h>
+#include <time.h>
 /* libwuya */
 #include "wuy_dict.h"
 #include "wuy_list.h"
@@ -44,6 +45,10 @@ static char *conf_lib_blacklist = NULL;
 /* LEAK_AFTER: start detect after this time (in second). */
 static long conf_start_ms = 0;
 
+#define _MAX_GLIBC_BACKTRACE_NUM  20
+/* LEAK_GLIBC_BACKTRACE_NUM: glibc backtrace number*/
+static int conf_glibc_backtrace_num = _MAX_GLIBC_BACKTRACE_NUM;
+
 
 /* ### hooking symbols */
 static void *(*leak_real_malloc)(size_t size) = NULL;
@@ -58,6 +63,12 @@ static bool leak_inited = false;
 static __thread bool leak_in_process = false;
 static FILE *leak_log_filp;
 
+/*A structure to store glibc backtrace information*/
+
+typedef struct {
+	int trace_num;
+	void *backtrace[0];
+} glibc_callstack_t;
 
 /* ### structures and utils for call-stack and memory-block */
 
@@ -69,6 +80,8 @@ struct leak_callstack {
 	size_t		alloc_size, free_size;
 	size_t		expired_size, free_expired_size;
 	time_t		free_min, free_max, free_total;
+
+	glibc_callstack_t *glibc_callstack;
 
 	wuy_list_t	expired_list;
 	wuy_dict_node_t	dict_node;
@@ -86,6 +99,7 @@ struct leak_memblock {
 	void		*address;
 	size_t		size;
 	time_t		create;
+	long      create_ns;
 	wuy_dict_node_t	dict_node;
 	wuy_list_node_t	list_node;
 
@@ -247,27 +261,34 @@ static void leak_report(void)
 		struct leak_callstack *cs = callstacks[i];
 
 		time_t unfree_max = 0;
+		time_t create_time = 0;
+		long   create_ns = 0;
 		if (!wuy_list_empty(&cs->expired_list)) {
 			struct leak_memblock *mb = wuy_containerof(
 				wuy_list_first(&cs->expired_list),
 				struct leak_memblock, list_node);
 			unfree_max = now - mb->create;
+			create_time = mb->create;
+			create_ns = mb->create_ns;
 		}
 		fprintf(leak_log_filp, "callstack[%d]: may-leak=%d (%zu bytes)\n"
-                                "    expired=%d (%zu bytes), free_expired=%d (%zu bytes)\n"
-                                "    alloc=%d (%zu bytes), free=%d (%zu bytes)\n"
-                                "    freed memory live time: min=%ld max=%ld average=%ld\n"
-                                "    un-freed memory live time: max=%ld\n",
-                                cs->id,
-                                cs->expired_count - cs->free_expired_count,
-                                cs->expired_size - cs->free_expired_size,
-                                cs->expired_count, cs->expired_size,
-                                cs->free_expired_count, cs->free_expired_size,
-                                cs->alloc_count, cs->alloc_size,
-                                cs->free_count, cs->free_size,
-                                cs->free_min, cs->free_max,
-                                cs->free_count ? cs->free_total / cs->free_count : 0,
-                                unfree_max);
+			"    expired=%d (%zu bytes), free_expired=%d (%zu bytes)\n"
+			"    alloc=%d (%zu bytes), free=%d (%zu bytes)\n"
+			"    freed memory live time: min=%ld max=%ld average=%ld\n"
+			"    un-freed memory live time: max=%ld\n"
+			"    create_time: %ld.%ld\n",
+			cs->id,
+			cs->expired_count - cs->free_expired_count,
+			cs->expired_size - cs->free_expired_size,
+			cs->expired_count, cs->expired_size,
+			cs->free_expired_count, cs->free_expired_size,
+			cs->alloc_count, cs->alloc_size,
+			cs->free_count, cs->free_size,
+			cs->free_min, cs->free_max,
+			cs->free_count ? cs->free_total / cs->free_count : 0,
+			unfree_max,
+			create_time,
+			create_ns);
 	}
 }
 
@@ -311,6 +332,15 @@ static void __attribute__((constructor))init(void)
 		conf_start_ms = leak_now_ms() + atoi(ev) * 1000;
 	}
 
+	ev = getenv("LEAK_GLIBC_BACKTRACE_NUM");
+	if (ev != NULL) {
+		conf_glibc_backtrace_num = atoi(ev);
+		if (conf_glibc_backtrace_num > _MAX_GLIBC_BACKTRACE_NUM)
+		{
+			conf_glibc_backtrace_num = _MAX_GLIBC_BACKTRACE_NUM;
+		}
+	}
+
 	/* hook symbols */
 	leak_real_malloc = dlsym(RTLD_NEXT, "malloc");
 	assert(leak_real_malloc != NULL);
@@ -346,7 +376,7 @@ static void __attribute__((constructor))init(void)
 
 	/* log file */
 	char log_fname[100];
-	sprintf(log_fname, "%s.%d", conf_log_file, getpid());
+	sprintf(log_fname, "%s.%d.log", conf_log_file, getpid());
 	leak_log_filp = fopen(log_fname, "w");
 	assert(leak_log_filp != NULL);
 
@@ -381,6 +411,28 @@ static void leak_callstack_print(struct leak_callstack *cs)
 	}
 }
 
+static void __print_glibc_backtrace(glibc_callstack_t *glibc_cs)
+{
+	char** messages = (char**)NULL;
+	int i;
+
+	messages = backtrace_symbols(glibc_cs->backtrace, glibc_cs->trace_num);
+	int skip = 3;
+	for (i = skip; i < glibc_cs->trace_num; ++i)
+	{
+		fprintf(leak_log_filp, "[glib bt]: (%d) %s\n", i, messages[i]);
+	}
+	free(messages);
+}
+
+/// @brief Get glibc backtrace.
+/// @param glibc_cs callstack index from glibc backtrace().
+static void __get_glibc_backtrace(glibc_callstack_t **glibc_cs)
+{
+	*glibc_cs = leak_real_calloc(1, sizeof(void*) * conf_glibc_backtrace_num + sizeof(glibc_callstack_t));
+	(*glibc_cs)->trace_num = backtrace((*glibc_cs)->backtrace, conf_glibc_backtrace_num);
+}
+
 static void leak_expire(void)
 {
 	time_t now = time(NULL);
@@ -407,22 +459,25 @@ static void leak_expire(void)
 		wuy_list_append(&cs->expired_list, &mb->list_node);
 		pthread_mutex_unlock(&cs->mutex);
 
-		fprintf(leak_log_filp, "callstack[%d] expires. count=%d size=%zu/%zu alloc=%d free=%d\n",
-				cs->id, cs->expired_count, mb->size, cs->expired_size,
-				cs->alloc_count, cs->free_count);
+		fprintf(leak_log_filp, "callstack[%d] create_time=%ld.%ld expires. count=%d size=%zu/%zu alloc=%d free=%d\n",
+			cs->id, mb->create, mb->create_ns, cs->expired_count, mb->size, cs->expired_size,
+			cs->alloc_count, cs->free_count);
+		__print_glibc_backtrace(cs->glibc_callstack);
 
-		if ((cs->expired_count % 100) == 1) {
+		if ((cs->expired_count % 10) == 1) {
 			/* print callstack once every 100 expiration */
-			leak_callstack_print(cs);
+			// leak_callstack_print(cs);
+			__print_glibc_backtrace(cs->glibc_callstack);
 		}
+		fprintf(leak_log_filp, "[glib bt]: ****************************************************\n");
 	}
+	fflush(leak_log_filp);
 	pthread_mutex_unlock(&leak_memblock_mutex);
 
-	fflush(leak_log_filp);
 }
 
 
-/* ### check LEAK_PID_FILE to enable/disable detectiong current process */
+/* ### check LEAK_PID_FILE to enable/disable detecting current process */
 static bool leak_enabled_check(void)
 {
 	/* enable all processes if LEAK_PID_CHECK is not set */
@@ -491,10 +546,11 @@ static int leak_backtrace_simple_cb(void *data, uintptr_t pc)
 static struct leak_callstack *leak_current(void)
 {
 	static int leak_callstack_id = 1;
+	int skip_callstack_num = 2;
 
 	struct leak_callstack current[20];
 	current->ip_num = 0;
-	if (backtrace_simple(btstate, 2, leak_backtrace_simple_cb, NULL, current) < 0) {
+	if (backtrace_simple(btstate, skip_callstack_num, leak_backtrace_simple_cb, NULL, current) < 0) {
 		return NULL;
 	}
 
@@ -507,6 +563,9 @@ static struct leak_callstack *leak_current(void)
 	}
 
 	cs = leak_real_calloc(1, sizeof(struct leak_callstack) + sizeof(void *) * current->ip_num);
+
+	__get_glibc_backtrace(&cs->glibc_callstack);
+
 	cs->id = leak_callstack_id++;
 	cs->ip_num = current->ip_num;
 	pthread_mutex_init(&cs->mutex, NULL);
@@ -556,11 +615,17 @@ static void leak_process_alloc(void *p, size_t size)
 	pthread_mutex_unlock(&cs->mutex);
 
 	pthread_mutex_lock(&leak_memblock_mutex);
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+
 	struct leak_memblock *mb = wuy_pool_alloc(leak_memblock_pool);
+
 	mb->address = p;
 	mb->size = size;
 	mb->expired = false;
-	mb->create = time(NULL);
+	mb->create = ts.tv_sec;
+	mb->create_ns = ts.tv_nsec;
+
 	mb->callstack = cs;
 
 	wuy_dict_add(leak_memblock_dict, mb);
@@ -611,8 +676,8 @@ static void leak_process_free(void *p)
 
 		time_t live = time(NULL) - mb->create;
 		fprintf(leak_log_filp, "callstack[%d] frees after expired."
-				" live=%ld expired=%d free_expired=%d\n",
-				cs->id, live, cs->expired_count, cs->free_expired_count);
+			" live=%ld expired=%d free_expired=%d create_time=%ld.%ld\n",
+			cs->id, live, cs->expired_count, cs->free_expired_count, mb->create, mb->create_ns);
 
 		if (conf_auto_expire && live > conf_expire) {
 			fprintf(leak_log_filp, "# increase expire from %ld to %ld.\n",
